@@ -1029,6 +1029,37 @@ func (cn *conn) saveMessage(typ proto.ResponseCode, buf *readBuf) error {
 	return nil
 }
 
+// maxErrorLength matches libpq's MAX_ERRLEN for detecting pre-protocol errors.
+// If an ErrorResponse has a length > 30000, libpq treats it as a pre-protocol
+// plain text error (e.g., "could not fork new process for connection").
+const maxErrorLength = 30000
+
+// readPreProtocolError reads a pre-protocol plain text error message.
+// When PostgreSQL cannot start a backend (e.g., an external process limit),
+// it sends plain text like "Ecould not fork new process for connection: ..."
+// The 'E' looks like an ErrorResponse type, but the rest is plain text.
+func readPreProtocolError(buf *bufio.Reader, header []byte) error {
+	// Read until null terminator or limit, matching libpq behavior
+	var msg []byte
+	msg = append(msg, header[1:]...) // skip the 'E', include "length" bytes as text
+
+	// Read more until null terminator (max ~256 bytes for these errors)
+	for i := 0; i < 256; i++ {
+		b, err := buf.ReadByte()
+		if err != nil || b == 0 {
+			break
+		}
+		msg = append(msg, b)
+	}
+
+	// Trim trailing whitespace
+	for len(msg) > 0 && (msg[len(msg)-1] == '\n' || msg[len(msg)-1] == '\r') {
+		msg = msg[:len(msg)-1]
+	}
+
+	return fmt.Errorf("server error: %s", string(msg))
+}
+
 // recvMessage receives any message from the backend, or returns an error if
 // a problem occurred while reading the message.
 func (cn *conn) recvMessage(r *readBuf) (proto.ResponseCode, error) {
@@ -1050,6 +1081,17 @@ func (cn *conn) recvMessage(r *readBuf) (proto.ResponseCode, error) {
 	// read the type and length of the message that follows
 	t := x[0]
 	n := int(binary.BigEndian.Uint32(x[1:])) - 4
+
+	// Detect pre-protocol errors, matching libpq's behavior (fe-connect.c).
+	// When PostgreSQL cannot start a backend (e.g., an external process limit),
+	// it sends plain text like "Ecould not fork new process...". The 'E' gets
+	// parsed as an ErrorResponse type, but the "length" is actually text.
+	// libpq checks: if ErrorResponse && (msgLength < 8 || msgLength > 30000),
+	// treat it as a pre-protocol plain text error.
+	if t == 'E' && (n < 4 || n > maxErrorLength) {
+		return 0, readPreProtocolError(cn.buf, x)
+	}
+
 	var y []byte
 	if n <= len(cn.scratch) {
 		y = cn.scratch[:n]
